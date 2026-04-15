@@ -1,21 +1,32 @@
+// Route pour servir une vidéo depuis GridFS
+router.get('/video/:id', async (req, res) => {
+  try {
+    const { initGridFS } = require('../models/gridfs');
+    const mongoose = require('mongoose');
+    const gfs = initGridFS(mongoose.connection);
+    const { ObjectId } = require('mongodb');
+    const fileId = new ObjectId(req.params.id);
+    const files = await mongoose.connection.db.collection('videos.files').find({ _id: fileId }).toArray();
+    if (!files || files.length === 0) {
+      return res.status(404).json({ message: 'Vidéo non trouvée' });
+    }
+    res.set('Content-Type', files[0].contentType || 'video/mp4');
+    const downloadStream = gfs.openDownloadStream(fileId);
+    downloadStream.pipe(res);
+  } catch (err) {
+    res.status(500).json({ message: 'Erreur serveur', error: err.message });
+  }
+});
 const express = require('express');
 const router = express.Router();
 const auth = require('../middleware/auth.middleware');
 const Patient = require('../models/Patient');
 const Session = require('../models/Session');
-const multer = require('multer');
-const path = require('path');
 
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => {
-    cb(null, 'uploads/videos/');
-  },
-  filename: (req, file, cb) => {
-    const suffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
-    cb(null, suffix + path.extname(file.originalname));
-  }
-});
-const upload = multer({ storage });
+const multer = require('multer');
+const upload = multer({ storage: multer.memoryStorage() });
+const { initGridFS } = require('../models/gridfs');
+const mongoose = require('mongoose');
 
 router.use(auth(['therapist']));
 
@@ -45,20 +56,40 @@ router.post('/sessions', upload.any(), async (req, res) => {
       exercises = JSON.parse(exercisesData);
     }
 
+    // Init GridFS bucket
+    const gfs = initGridFS(mongoose.connection);
+
+    // Upload videos to GridFS and get their ids
+    const exercisePromises = exercises.map(async (ex, i) => {
+      const file = req.files.find(f => f.fieldname === `video_${i}`);
+      let videoId = null;
+      if (file) {
+        // Store in GridFS
+        const uploadStream = gfs.openUploadStream(file.originalname, {
+          contentType: file.mimetype
+        });
+        uploadStream.end(file.buffer);
+        await new Promise((resolve, reject) => {
+          uploadStream.on('finish', resolve);
+          uploadStream.on('error', reject);
+        });
+        videoId = uploadStream.id;
+      }
+      return {
+        title: ex.title,
+        description: ex.description,
+        duration: ex.duration,
+        repetitions: ex.repetitions,
+        videoPath: videoId ? `/api/therapist/video/${videoId}` : (ex.videoUrl || '')
+      };
+    });
+
+    const exercisesWithVideos = await Promise.all(exercisePromises);
+
     const newSession = new Session({
       therapistId: req.user.userId,
       title,
-      exercises: exercises.map((ex, i) => {
-        // Chercher si un fichier a été uploadé pour cet index
-        const file = req.files.find(f => f.fieldname === `video_${i}`);
-        return {
-          title: ex.title,
-          description: ex.description,
-          duration: ex.duration,
-          repetitions: ex.repetitions,
-          videoPath: file ? `http://localhost:5000/uploads/videos/${file.filename}` : (ex.videoUrl || '')
-        };
-      })
+      exercises: exercisesWithVideos
     });
 
     await newSession.save();
@@ -98,20 +129,38 @@ router.put('/sessions/:id', upload.any(), async (req, res) => {
       exercises = JSON.parse(exercisesData);
     }
 
+    const gfs = initGridFS(mongoose.connection);
+
+    const exercisePromises = exercises.map(async (ex, i) => {
+      const file = req.files.find(f => f.fieldname === `video_${i}`);
+      let videoId = null;
+      if (file) {
+        const uploadStream = gfs.openUploadStream(file.originalname, {
+          contentType: file.mimetype
+        });
+        uploadStream.end(file.buffer);
+        await new Promise((resolve, reject) => {
+          uploadStream.on('finish', resolve);
+          uploadStream.on('error', reject);
+        });
+        videoId = uploadStream.id;
+      }
+      return {
+        title: ex.title,
+        description: ex.description,
+        duration: ex.duration,
+        repetitions: ex.repetitions,
+        videoPath: videoId ? `/api/therapist/video/${videoId}` : (ex.videoPath || ex.videoUrl || '')
+      };
+    });
+
+    const exercisesWithVideos = await Promise.all(exercisePromises);
+
     const updatedSession = await Session.findOneAndUpdate(
       { _id: req.params.id, therapistId: req.user.userId },
       {
         title,
-        exercises: exercises.map((ex, i) => {
-          const file = req.files.find(f => f.fieldname === `video_${i}`);
-          return {
-            title: ex.title,
-            description: ex.description,
-            duration: ex.duration,
-            repetitions: ex.repetitions,
-            videoPath: file ? `http://localhost:5000/uploads/videos/${file.filename}` : (ex.videoPath || ex.videoUrl || '')
-          };
-        })
+        exercises: exercisesWithVideos
       },
       { new: true }
     );
